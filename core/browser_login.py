@@ -177,6 +177,8 @@ class _Cdp:
     def __init__(self, ws: Any) -> None:
         self._ws = ws
         self._next_id = 0
+        # Пока не None — сюда складываются события CDP (см. page_user_agent).
+        self._events: list[dict[str, Any]] | None = None
 
     async def call(
         self, method: str, session_id: str = "", **params: Any
@@ -190,13 +192,66 @@ class _Cdp:
         while True:
             reply = json.loads(await self._ws.recv())
             if reply.get("id") != msg_id:
-                continue  # события CDP нам не нужны
+                if self._events is not None and "method" in reply:
+                    self._events.append(reply)
+                continue
             if "error" in reply:
                 raise BrowserLoginError(
                     f"DevTools {method}: {reply['error'].get('message', reply['error'])}",
                     code="CDP_ERROR",
                 )
             return reply.get("result") or {}
+
+    async def page_user_agent(self, target_id: str) -> tuple[str, str]:
+        """User-Agent, который вкладка реально отправляет порталу: (UA, источник).
+
+        Browser.getVersion для этого не годится: Edge для части сайтов (в т.ч.
+        goszakup) подменяет UA на «чистый» Chrome без «Edg/…», а портал
+        (CodeIgniter) сверяет UA сессии и отбрасывает сессию при расхождении.
+        Поэтому из вкладки делается лёгкий запрос, и UA берётся из его
+        заголовков; запасной вариант — navigator.userAgent.
+        """
+        if not target_id:
+            return "", ""
+        try:
+            attached = await self.call(
+                "Target.attachToTarget", targetId=target_id, flatten=True
+            )
+            session_id = str(attached.get("sessionId") or "")
+            try:
+                self._events = []
+                await self.call("Network.enable", session_id=session_id)
+                await self.call(
+                    "Runtime.evaluate",
+                    session_id=session_id,
+                    expression=(
+                        "fetch(location.origin + '/favicon.ico', "
+                        "{credentials: 'include', cache: 'no-store', "
+                        "signal: AbortSignal.timeout(5000)})"
+                        ".then(r => r.status, () => 0)"
+                    ),
+                    awaitPromise=True,
+                    returnByValue=True,
+                )
+                events, self._events = self._events, None
+                await self.call("Network.disable", session_id=session_id)
+                header = _user_agent_from_events(events, session_id)
+                if header:
+                    return header, "request"
+                result = await self.call(
+                    "Runtime.evaluate",
+                    session_id=session_id,
+                    expression="navigator.userAgent",
+                    returnByValue=True,
+                )
+                value = str((result.get("result") or {}).get("value") or "")
+                return value, ("navigator" if value else "")
+            finally:
+                self._events = None
+                await self.call("Target.detachFromTarget", sessionId=session_id)
+        except BrowserLoginError as exc:
+            LOG.debug("UA вкладки не получен: %s", exc)
+            return "", ""
 
     async def page_logged_in(self, target_id: str, marker: str) -> bool:
         """Видит ли сама вкладка браузера признак вошедшего пользователя."""
@@ -223,6 +278,33 @@ class _Cdp:
         except BrowserLoginError:
             return False
         return bool((result.get("result") or {}).get("value"))
+
+
+def _user_agent_from_events(
+    events: Iterable[Mapping[str, Any]], session_id: str
+) -> str:
+    """UA из сетевых событий вкладки; ExtraInfo — фактически отправленные заголовки."""
+    sent = extra = ""
+    for event in events:
+        if event.get("sessionId") != session_id:
+            continue
+        params = event.get("params") or {}
+        if event.get("method") == "Network.requestWillBeSentExtraInfo":
+            headers = params.get("headers") or {}
+        elif event.get("method") == "Network.requestWillBeSent":
+            headers = (params.get("request") or {}).get("headers") or {}
+        else:
+            continue
+        value = next(
+            (str(v) for k, v in headers.items() if k.lower() == "user-agent"), ""
+        )
+        if not value:
+            continue
+        if event.get("method") == "Network.requestWillBeSentExtraInfo":
+            extra = extra or value
+        else:
+            sent = sent or value
+    return extra or sent
 
 
 async def _devtools_version(port: int) -> dict[str, Any] | None:
@@ -310,6 +392,7 @@ async def capture_portal_session(
     reject_after: int = 3,
     logged_in_marker: str = "/user/sso_logout",
     launch_timeout: float = 20.0,
+    no_cabinet_hint_after: float = 90.0,
     on_browser_ready: Callable[[], None] | None = None,
 ) -> T:
     """Открывает вход в браузере и ждёт сессию кабинета.
@@ -332,10 +415,15 @@ async def capture_portal_session(
         exe, profile_dir, login_url, launch_timeout
     )
     LOG.info(
-        "Браузер для входа %s: войдите на портале по ЭЦП — FastBid подхватит сессию",
+        "Браузер для входа %s (%s): войдите на портале по ЭЦП именно в этом окне — "
+        "вход в вашем обычном браузере FastBid не видит",
         "уже открыт" if reused else "запущен",
+        Path(exe).name,
     )
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    hinted_no_cabinet = False
+    tab_user_agents: dict[str, str] = {}
     last_signature: tuple[str, tuple[str, ...]] | None = None
     last_attempt = 0.0
     last_reason = ""
@@ -357,9 +445,38 @@ async def capture_portal_session(
                 pages = _cabinet_pages(targets, cabinet_host)
                 signature = (header, tuple(url for url, _ in pages))
                 due = time.monotonic() - last_attempt >= revalidate_interval
+                if (
+                    not pages
+                    and not hinted_no_cabinet
+                    and (time.monotonic() - started >= no_cabinet_hint_after)
+                ):
+                    hinted_no_cabinet = True
+                    LOG.warning(
+                        "В окне браузера, открытом FastBid, кабинет %s пока не "
+                        "открыт. Войдите по ЭЦП именно в этом окне и дождитесь "
+                        "страницы кабинета.",
+                        cabinet_host,
+                    )
                 if header and pages and (signature != last_signature or due):
                     last_signature = signature
                     last_attempt = time.monotonic()
+                    target_id = pages[0][1]
+                    session_ua = tab_user_agents.get(target_id, "")
+                    if not session_ua:
+                        tab_ua, source = await cdp.page_user_agent(target_id)
+                        session_ua = tab_ua or user_agent
+                        # Неудачный замер (вкладка перезагружалась) не кэшируется.
+                        if tab_ua:
+                            tab_user_agents[target_id] = tab_ua
+                        LOG.info(
+                            "Кабинет открыт в браузере: %s. User-Agent для "
+                            "запросов FastBid взят %s",
+                            pages[0][0],
+                            {
+                                "request": "из запроса вкладки",
+                                "navigator": "из navigator.userAgent вкладки",
+                            }.get(source, "из версии браузера"),
+                        )
                     session = BrowserSession(
                         cookies=tuple(
                             c
@@ -367,7 +484,7 @@ async def capture_portal_session(
                             if _domain_matches(cabinet_host, str(c.get("domain") or ""))
                         ),
                         cookie_header=header,
-                        user_agent=user_agent,
+                        user_agent=session_ua,
                         page_url=pages[0][0],
                     )
                     try:
