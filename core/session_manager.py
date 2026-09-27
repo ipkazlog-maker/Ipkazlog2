@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -351,7 +352,11 @@ class SessionManager:
         )
 
     async def apply_manual_token(
-        self, raw_credential: str, check_url: str = ""
+        self,
+        raw_credential: str,
+        check_url: str = "",
+        user_agent: str = "",
+        cookies: tuple[dict[str, Any], ...] = (),
     ) -> KeyInfo:
         """Импорт РЕАЛЬНОЙ сессии портала из браузера (Cookie/токен).
 
@@ -361,7 +366,9 @@ class SessionManager:
         финального контракта подачи.
 
         ``check_url`` — страница кабинета для проверки сессии в LIVE (по
-        умолчанию ``cabinet_check_path``).
+        умолчанию ``cabinet_check_path``). ``user_agent`` и ``cookies``
+        (формат CDP) приходят при захвате из браузера: запросы идут с тем же
+        User-Agent, а Cookie — с доменом и путём, как у браузера.
         """
         token, cookie_header = self.parse_credential(raw_credential)
         if not token and not cookie_header:
@@ -371,14 +378,29 @@ class SessionManager:
             )
         self.clear_credentials()
         self._set_state(SessionState.AUTHENTICATING)
-        if cookie_header:
+        cabinet_host = urlsplit(self.settings.endpoints.cabinet_base).hostname or ""
+        if cookies:
+            for cookie in cookies:
+                self.client.cookies.set(
+                    str(cookie.get("name") or ""),
+                    str(cookie.get("value") or ""),
+                    domain=str(cookie.get("domain") or cabinet_host),
+                    path=str(cookie.get("path") or "/"),
+                )
+        elif cookie_header:
+            # Домен обязателен: иначе Set-Cookie портала (ротация сессии) не
+            # заменит cookie, и в запросе окажутся два значения с одним именем.
             for pair in cookie_header.split(";"):
                 name, _, value = pair.strip().partition("=")
                 if name and value:
-                    self.client.cookies.set(name, value)
+                    self.client.cookies.set(name, value, domain=cabinet_host, path="/")
         if token:
             self.token = token
+        if token and not cookie_header:
+            # Bearer — только для «голого» токена: браузер кабинету его не шлёт.
             self.client.headers["Authorization"] = f"Bearer {token}"
+        if user_agent:
+            self.client.headers["User-Agent"] = user_agent
         self.token_only = True
         self._keepalive_failures = 0
 
@@ -434,6 +456,7 @@ class SessionManager:
         self.token_only = False
         self.client.cookies.clear()
         self.client.headers.pop("Authorization", None)
+        self.client.headers["User-Agent"] = self.default_headers()["User-Agent"]
         self._authenticated_monotonic = 0.0
         self.key_info = KeyInfo()
         self._set_state(SessionState.OFFLINE)

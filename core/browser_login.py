@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
@@ -33,6 +34,7 @@ from utils.logger import get_logger
 
 __all__ = [
     "BrowserLoginError",
+    "BrowserSession",
     "capture_portal_session",
     "cookie_header_for_host",
     "find_browser",
@@ -140,9 +142,11 @@ def _is_auth_url(url: str) -> bool:
     return "login" in path or "sso" in path
 
 
-def _cabinet_pages(targets: Iterable[Mapping[str, Any]], host: str) -> list[str]:
-    """Открытые вкладки кабинета, не являющиеся страницами входа."""
-    pages: list[str] = []
+def _cabinet_pages(
+    targets: Iterable[Mapping[str, Any]], host: str
+) -> list[tuple[str, str]]:
+    """Открытые вкладки кабинета (url, targetId), не являющиеся страницами входа."""
+    pages: list[tuple[str, str]] = []
     for target in targets:
         url = str(target.get("url") or "")
         if target.get("type") != "page" or not url.startswith("https://"):
@@ -150,8 +154,18 @@ def _cabinet_pages(targets: Iterable[Mapping[str, Any]], host: str) -> list[str]
         if (urlsplit(url).hostname or "").lower() == host.lower() and not _is_auth_url(
             url
         ):
-            pages.append(url)
+            pages.append((url, str(target.get("targetId") or "")))
     return pages
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserSession:
+    """Сессия кабинета, снятая с браузера: Cookie, User-Agent и открытая страница."""
+
+    cookies: tuple[dict[str, Any], ...]
+    cookie_header: str
+    user_agent: str
+    page_url: str
 
 
 # --------------------------------------------------------------------------- #
@@ -164,22 +178,51 @@ class _Cdp:
         self._ws = ws
         self._next_id = 0
 
-    async def call(self, method: str, **params: Any) -> dict[str, Any]:
+    async def call(
+        self, method: str, session_id: str = "", **params: Any
+    ) -> dict[str, Any]:
         self._next_id += 1
         msg_id = self._next_id
-        await self._ws.send(
-            json.dumps({"id": msg_id, "method": method, "params": params})
-        )
+        message: dict[str, Any] = {"id": msg_id, "method": method, "params": params}
+        if session_id:
+            message["sessionId"] = session_id
+        await self._ws.send(json.dumps(message))
         while True:
-            message = json.loads(await self._ws.recv())
-            if message.get("id") != msg_id:
+            reply = json.loads(await self._ws.recv())
+            if reply.get("id") != msg_id:
                 continue  # события CDP нам не нужны
-            if "error" in message:
+            if "error" in reply:
                 raise BrowserLoginError(
-                    f"DevTools {method}: {message['error'].get('message', message['error'])}",
+                    f"DevTools {method}: {reply['error'].get('message', reply['error'])}",
                     code="CDP_ERROR",
                 )
-            return message.get("result") or {}
+            return reply.get("result") or {}
+
+    async def page_logged_in(self, target_id: str, marker: str) -> bool:
+        """Видит ли сама вкладка браузера признак вошедшего пользователя."""
+        if not target_id:
+            return False
+        try:
+            attached = await self.call(
+                "Target.attachToTarget", targetId=target_id, flatten=True
+            )
+            session_id = str(attached.get("sessionId") or "")
+            try:
+                result = await self.call(
+                    "Runtime.evaluate",
+                    session_id=session_id,
+                    expression=(
+                        "document.documentElement.outerHTML.includes("
+                        + json.dumps(marker)
+                        + ")"
+                    ),
+                    returnByValue=True,
+                )
+            finally:
+                await self.call("Target.detachFromTarget", sessionId=session_id)
+        except BrowserLoginError:
+            return False
+        return bool((result.get("result") or {}).get("value"))
 
 
 async def _devtools_version(port: int) -> dict[str, Any] | None:
@@ -258,20 +301,25 @@ async def capture_portal_session(
     *,
     login_url: str,
     cabinet_host: str,
-    validate: Callable[[str, str], Awaitable[T | None]],
+    validate: Callable[[BrowserSession], Awaitable[T]],
     profile_dir: Path,
     browser: str | None = None,
     timeout: float = 600.0,
     poll_interval: float = 1.5,
+    revalidate_interval: float = 10.0,
+    reject_after: int = 3,
+    logged_in_marker: str = "/user/sso_logout",
     launch_timeout: float = 20.0,
     on_browser_ready: Callable[[], None] | None = None,
 ) -> T:
     """Открывает вход в браузере и ждёт сессию кабинета.
 
-    ``validate(cookie_header, page_url)`` проверяет Cookie на портале:
-    возвращает результат при успехе и ``None``, если сессия ещё не готова
-    (пользователь не завершил вход). Вызывается только при изменении Cookie
-    или открытых страниц кабинета — портал не опрашивается впустую.
+    ``validate(session)`` проверяет сессию на портале вне браузера: возвращает
+    результат или бросает исключение с причиной. Проверка повторяется при
+    изменении Cookie/вкладок и не реже ``revalidate_interval``. Если вкладка
+    браузера уже показывает вошедшего пользователя, а проверка отклонена
+    ``reject_after`` раз подряд, ожидание прерывается с причиной — вместо
+    бесконечного «жду вход».
     """
     exe = browser or find_browser()
     if not exe:
@@ -289,9 +337,15 @@ async def capture_portal_session(
     )
     deadline = time.monotonic() + timeout
     last_signature: tuple[str, tuple[str, ...]] | None = None
+    last_attempt = 0.0
+    last_reason = ""
+    rejected_while_logged_in = 0
     try:
         async with connect(ws_url, max_size=None, open_timeout=5) as ws:
             cdp = _Cdp(ws)
+            user_agent = str(
+                (await cdp.call("Browser.getVersion")).get("userAgent") or ""
+            )
             if reused:
                 await cdp.call("Target.createTarget", url=login_url)
             if on_browser_ready is not None:
@@ -301,17 +355,45 @@ async def capture_portal_session(
                 targets = (await cdp.call("Target.getTargets")).get("targetInfos") or []
                 header = cookie_header_for_host(cookies, cabinet_host)
                 pages = _cabinet_pages(targets, cabinet_host)
-                signature = (header, tuple(pages))
-                if header and pages and signature != last_signature:
+                signature = (header, tuple(url for url, _ in pages))
+                due = time.monotonic() - last_attempt >= revalidate_interval
+                if header and pages and (signature != last_signature or due):
                     last_signature = signature
-                    result = await validate(header, pages[0])
-                    if result is not None:
-                        return result
+                    last_attempt = time.monotonic()
+                    session = BrowserSession(
+                        cookies=tuple(
+                            c
+                            for c in cookies
+                            if _domain_matches(cabinet_host, str(c.get("domain") or ""))
+                        ),
+                        cookie_header=header,
+                        user_agent=user_agent,
+                        page_url=pages[0][0],
+                    )
+                    try:
+                        return await validate(session)
+                    except Exception as exc:  # причина — в журнал и в ошибку
+                        reason = str(exc) or type(exc).__name__
+                    if reason != last_reason:
+                        LOG.warning("Сессия из браузера пока не принята: %s", reason)
+                        last_reason = reason
+                    if await cdp.page_logged_in(pages[0][1], logged_in_marker):
+                        rejected_while_logged_in += 1
+                        if rejected_while_logged_in >= reject_after:
+                            raise BrowserLoginError(
+                                "В браузере вход выполнен, но портал не принимает "
+                                f"эту сессию от FastBid: {reason}",
+                                code="SESSION_REPLAY_REJECTED",
+                            )
+                    else:
+                        rejected_while_logged_in = 0
                 await asyncio.sleep(poll_interval)
     except (OSError, WebSocketException) as exc:
         raise BrowserLoginError(
             "Окно браузера закрыто до завершения входа", code="BROWSER_CLOSED"
         ) from exc
     raise BrowserLoginError(
-        f"Вход на портале не завершён за {timeout / 60:.0f} мин", code="BROWSER_TIMEOUT"
+        f"Вход на портале не завершён за {timeout / 60:.0f} мин"
+        + (f" (последняя причина: {last_reason})" if last_reason else ""),
+        code="BROWSER_TIMEOUT",
     )

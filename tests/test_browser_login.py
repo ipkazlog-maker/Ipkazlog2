@@ -13,6 +13,7 @@ from websockets.asyncio.server import serve
 
 from core.browser_login import (
     BrowserLoginError,
+    BrowserSession,
     _cabinet_pages,
     capture_portal_session,
     cookie_header_for_host,
@@ -39,16 +40,21 @@ def test_cabinet_pages_skip_login_and_foreign() -> None:
         {"type": "page", "url": f"https://{HOST}/ru/user/login"},
         {"type": "page", "url": "https://zakup.gov.kz/ru/cabinet"},
         {"type": "service_worker", "url": f"https://{HOST}/sw.js"},
-        {"type": "page", "url": f"https://{HOST}/ru/cabinet/profile"},
+        {"type": "page", "url": f"https://{HOST}/ru/cabinet/profile", "targetId": "T1"},
     ]
-    assert _cabinet_pages(targets, HOST) == [f"https://{HOST}/ru/cabinet/profile"]
+    assert _cabinet_pages(targets, HOST) == [
+        (f"https://{HOST}/ru/cabinet/profile", "T1")
+    ]
 
 
 class FakeBrowser:
     """DevTools-эндпоинт: /json/version + websocket с Storage/Target."""
 
-    def __init__(self, stages: list[tuple[list[dict], list[dict]]]) -> None:
+    def __init__(
+        self, stages: list[tuple[list[dict], list[dict]]], page_logged_in: bool = False
+    ) -> None:
         self.stages = stages
+        self.page_logged_in = page_logged_in
         self.polls = 0
         self.methods: list[str] = []
         self.close_after: int | None = None
@@ -80,6 +86,13 @@ class FakeBrowser:
                     await ws.send(json.dumps({"id": msg["id"], "result": result}))
                     await ws.close()
                     return
+            elif msg["method"] == "Browser.getVersion":
+                result = {"userAgent": "Mozilla/5.0 TestEdge/1.0"}
+            elif msg["method"] == "Target.attachToTarget":
+                result = {"sessionId": "S1"}
+            elif msg["method"] == "Runtime.evaluate":
+                assert msg.get("sessionId") == "S1"
+                result = {"result": {"type": "boolean", "value": self.page_logged_in}}
             else:
                 result = {}
             await ws.send(json.dumps({"id": msg["id"], "result": result}))
@@ -101,6 +114,24 @@ def _profile_with_port(tmp_path, port: int):
     return profile
 
 
+CABINET = f"https://{HOST}/ru/cabinet/profile"
+
+
+async def capture(tmp_path, stages, validate, page_logged_in=False, **kwargs):
+    async with FakeBrowser(stages, page_logged_in=page_logged_in) as fake:
+        result = await capture_portal_session(
+            login_url=LOGIN_URL,
+            cabinet_host=HOST,
+            validate=validate,
+            profile_dir=_profile_with_port(tmp_path, fake.port),
+            browser="unused-when-reused",
+            poll_interval=0.01,
+            timeout=10,
+            **kwargs,
+        )
+        return result, fake
+
+
 def test_capture_waits_for_login_then_validates(tmp_path) -> None:
     session_cookie = [
         {"name": "ci_session", "value": "s1", "domain": HOST, "expires": -1}
@@ -109,45 +140,71 @@ def test_capture_waits_for_login_then_validates(tmp_path) -> None:
         {"name": "ci_session", "value": "anon", "domain": HOST, "expires": -1}
     ]
     login_tab = [{"type": "page", "url": LOGIN_URL}]
-    cabinet_tab = [{"type": "page", "url": f"https://{HOST}/ru/cabinet/profile"}]
+    cabinet_tab = [{"type": "page", "url": CABINET, "targetId": "T1"}]
     stages = [
         (anon_cookie, login_tab),  # вход ещё не выполнен — проверять нечего
-        (anon_cookie, cabinet_tab),  # портал ещё не принял — validate → None
+        (anon_cookie, cabinet_tab),  # портал ещё не принял — validate отклоняет
         (anon_cookie, cabinet_tab),  # то же состояние — повторно не проверяем
         (session_cookie, cabinet_tab),  # вход завершён
     ]
-    checked: list[tuple[str, str]] = []
+    checked: list[tuple[str, str, str]] = []
 
-    async def validate(header: str, url: str) -> str | None:
-        checked.append((header, url))
-        return "ok" if header == "ci_session=s1" else None
+    async def validate(browser: BrowserSession) -> str:
+        checked.append((browser.cookie_header, browser.page_url, browser.user_agent))
+        if browser.cookie_header != "ci_session=s1":
+            raise RuntimeError("страница входа")
+        assert browser.cookies[0]["domain"] == HOST
+        return "ok"
 
-    async def scenario() -> tuple[str, FakeBrowser]:
-        async with FakeBrowser(stages) as fake:
-            result = await capture_portal_session(
-                login_url=LOGIN_URL,
-                cabinet_host=HOST,
-                validate=validate,
-                profile_dir=_profile_with_port(tmp_path, fake.port),
-                browser="unused-when-reused",
-                poll_interval=0.01,
-                timeout=10,
-            )
-            return result, fake
-
-    result, fake = asyncio.run(scenario())
+    result, fake = asyncio.run(capture(tmp_path, stages, validate))
     assert result == "ok"
     assert checked == [
-        ("ci_session=anon", f"https://{HOST}/ru/cabinet/profile"),
-        ("ci_session=s1", f"https://{HOST}/ru/cabinet/profile"),
+        ("ci_session=anon", CABINET, "Mozilla/5.0 TestEdge/1.0"),
+        ("ci_session=s1", CABINET, "Mozilla/5.0 TestEdge/1.0"),
     ]
     # Уже открытый браузер FastBid: вход открывается новой вкладкой.
-    assert fake.methods[0] == "Target.createTarget"
+    assert "Target.createTarget" in fake.methods
+
+
+def test_capture_revalidates_unchanged_cookies(tmp_path) -> None:
+    """Сбой проверки (сеть/медленный портал) не оставляет ждать вечно."""
+    cookie = [{"name": "ci_session", "value": "s1", "domain": HOST, "expires": -1}]
+    stages = [(cookie, [{"type": "page", "url": CABINET, "targetId": "T1"}])]
+    attempts: list[int] = []
+
+    async def validate(browser: BrowserSession) -> str:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("Сетевая ошибка: timeout")
+        return "ok"
+
+    result, _ = asyncio.run(
+        capture(tmp_path, stages, validate, revalidate_interval=0.02)
+    )
+    assert result == "ok" and len(attempts) == 3
+
+
+def test_capture_reports_rejected_replay(tmp_path) -> None:
+    """Браузер вошёл, а портал отвергает сессию вне браузера → ошибка с причиной."""
+    cookie = [{"name": "ci_session", "value": "s1", "domain": HOST, "expires": -1}]
+    stages = [(cookie, [{"type": "page", "url": CABINET, "targetId": "T1"}])]
+
+    async def validate(browser: BrowserSession) -> str:
+        raise RuntimeError("Токен не принят порталом (HTTP 401)")
+
+    with pytest.raises(BrowserLoginError) as info:
+        asyncio.run(
+            capture(
+                tmp_path, stages, validate, revalidate_interval=0.0, page_logged_in=True
+            )
+        )
+    assert info.value.code == "SESSION_REPLAY_REJECTED"
+    assert "HTTP 401" in str(info.value)
 
 
 def test_capture_reports_closed_browser(tmp_path) -> None:
-    async def validate(header: str, url: str) -> None:
-        return None
+    async def validate(browser: BrowserSession) -> None:
+        raise RuntimeError("не вошёл")
 
     async def scenario() -> None:
         async with FakeBrowser([([], [])]) as fake:
@@ -172,8 +229,8 @@ def test_capture_without_browser(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(module, "find_browser", lambda override="": None)
 
-    async def validate(header: str, url: str) -> None:
-        return None
+    async def validate(browser: BrowserSession) -> None:
+        raise RuntimeError("не вошёл")
 
     with pytest.raises(BrowserLoginError) as info:
         asyncio.run(

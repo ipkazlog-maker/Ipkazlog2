@@ -42,7 +42,12 @@ from config.settings import (
     ProfileSettings,
 )
 from core.bid_pipeline import BidPipeline, BidRequest, BidResult
-from core.browser_login import BrowserLoginError, capture_portal_session, find_browser
+from core.browser_login import (
+    BrowserLoginError,
+    BrowserSession,
+    capture_portal_session,
+    find_browser,
+)
 from core.draft_submit import DraftRef, DraftSubmitter, parse_draft_ref
 from core.license_guard import LicenseGuard, LicenseStatus
 from core import ecp_store
@@ -276,16 +281,20 @@ class Backend:
         ecp = self.settings.ecp
         cabinet_host = urlsplit(self.settings.endpoints.cabinet_base).hostname or ""
 
-        async def validate(cookie_header: str, page_url: str) -> dict[str, Any] | None:
-            try:
-                key_info = await self.session.apply_manual_token(
-                    cookie_header, check_url=page_url
-                )
-            except PortalError as exc:
-                # Вход в браузере ещё не завершён или портал временно недоступен.
-                self.log.debug("Сессия из браузера пока не принята: %s", exc)
-                return None
-            ecp_store.save_secret(ecp.session_file, cookie_header)
+        async def validate(browser: BrowserSession) -> dict[str, Any]:
+            # PortalError с причиной уходит в capture_portal_session → журнал.
+            key_info = await self.session.apply_manual_token(
+                browser.cookie_header,
+                check_url=browser.page_url,
+                user_agent=browser.user_agent,
+                cookies=browser.cookies,
+            )
+            ecp_store.save_secret(
+                ecp.session_file,
+                json.dumps(
+                    {"cookie": browser.cookie_header, "user_agent": browser.user_agent}
+                ),
+            )
             self.refresh_license()
             return {"key_info": key_info, "license_warning": ""}
 
@@ -315,8 +324,17 @@ class Backend:
         saved = ecp_store.load_secret(self.settings.ecp.session_file)
         if not saved:
             return
+        cookie, user_agent = saved, ""
+        if saved.startswith("{"):
+            # Сессия из браузера: Cookie + User-Agent того браузера.
+            try:
+                data = json.loads(saved)
+                cookie = str(data.get("cookie") or "")
+                user_agent = str(data.get("user_agent") or "")
+            except (ValueError, AttributeError):
+                pass
         try:
-            await self.session.apply_manual_token(saved)
+            await self.session.apply_manual_token(cookie, user_agent=user_agent)
             self.log.info("Сессия портала восстановлена из защищённого хранилища")
         except PortalError as exc:
             self.session.mark_auth_failed()

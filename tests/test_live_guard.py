@@ -337,3 +337,71 @@ def test_confirm_open_first_check_is_immediate(mock) -> None:
     elapsed = run(scenario())
     # Раньше перед первой проверкой была пауза post_open_interval (300 мс).
     assert elapsed < mock.watcher.post_open_interval / 2
+
+
+def test_live_browser_cookie_import_matches_browser(live) -> None:
+    """Cookie из браузера: без Authorization, с его User-Agent; ротация сессии
+    портала (Set-Cookie) заменяет cookie, а не дублирует его."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            text='<a href="/ru/user/sso_logout">Выход</a>',
+            headers={"Set-Cookie": "ci_session=rotated; Path=/; HttpOnly"},
+        )
+
+    async def scenario() -> None:
+        session = _session_with_transport(live, handler)
+        try:
+            await session.apply_manual_token(
+                "ci_session=abc; _ga=GA1",
+                user_agent="Mozilla/5.0 Edg/140.0",
+                cookies=(
+                    {
+                        "name": "ci_session",
+                        "value": "abc",
+                        "domain": "v3bl.goszakup.gov.kz",
+                        "path": "/",
+                    },
+                    {
+                        "name": "_ga",
+                        "value": "GA1",
+                        "domain": ".goszakup.gov.kz",
+                        "path": "/",
+                    },
+                ),
+            )
+            await session.check_cabinet_page()
+        finally:
+            await session.close()
+
+    run(scenario())
+    first, second = seen
+    assert "authorization" not in first.headers
+    assert first.headers["user-agent"] == "Mozilla/5.0 Edg/140.0"
+    assert sorted(first.headers["cookie"].split("; ")) == ["_ga=GA1", "ci_session=abc"]
+    assert sorted(second.headers["cookie"].split("; ")) == [
+        "_ga=GA1",
+        "ci_session=rotated",
+    ]
+
+
+def test_pasted_cookie_string_sends_no_bearer(live) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text='<a href="/ru/user/sso_logout">Выход</a>')
+
+    async def scenario() -> None:
+        session = _session_with_transport(live, handler)
+        try:
+            await session.apply_manual_token("Cookie: ci_session=abc")
+        finally:
+            await session.close()
+
+    run(scenario())
+    assert "authorization" not in seen[0].headers
+    assert seen[0].headers["cookie"] == "ci_session=abc"
