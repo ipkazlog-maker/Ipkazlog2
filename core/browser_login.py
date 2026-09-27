@@ -226,7 +226,8 @@ class _Cdp:
                     session_id=session_id,
                     expression=(
                         "fetch(location.origin + '/favicon.ico', "
-                        "{credentials: 'include', cache: 'no-store'})"
+                        "{credentials: 'include', cache: 'no-store', "
+                        "signal: AbortSignal.timeout(5000)})"
                         ".then(r => r.status, () => 0)"
                     ),
                     awaitPromise=True,
@@ -460,9 +461,13 @@ async def capture_portal_session(
                     last_signature = signature
                     last_attempt = time.monotonic()
                     target_id = pages[0][1]
-                    if target_id not in tab_user_agents:
+                    session_ua = tab_user_agents.get(target_id, "")
+                    if not session_ua:
                         tab_ua, source = await cdp.page_user_agent(target_id)
-                        tab_user_agents[target_id] = tab_ua or user_agent
+                        session_ua = tab_ua or user_agent
+                        # Неудачный замер (вкладка перезагружалась) не кэшируется.
+                        if tab_ua:
+                            tab_user_agents[target_id] = tab_ua
                         LOG.info(
                             "Кабинет открыт в браузере: %s. User-Agent для "
                             "запросов FastBid взят %s",
@@ -479,7 +484,7 @@ async def capture_portal_session(
                             if _domain_matches(cabinet_host, str(c.get("domain") or ""))
                         ),
                         cookie_header=header,
-                        user_agent=tab_user_agents[target_id],
+                        user_agent=session_ua,
                         page_url=pages[0][0],
                     )
                     try:

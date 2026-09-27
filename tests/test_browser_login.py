@@ -316,3 +316,27 @@ def test_user_agent_fallbacks(tmp_path, navigator_ua, expected) -> None:
 
     asyncio.run(capture(tmp_path, stages, validate, configure=configure))
     assert seen == [expected]
+
+
+def test_failed_user_agent_probe_is_retried(tmp_path) -> None:
+    """Замер UA не удался (вкладка перезагружалась) → повтор при следующей проверке."""
+    cookie = [{"name": "ci_session", "value": "s1", "domain": HOST, "expires": -1}]
+    stages = [(cookie, [{"type": "page", "url": CABINET, "targetId": "T1"}])]
+    seen: list[str] = []
+    fake_ref: list[FakeBrowser] = []
+
+    async def validate(browser: BrowserSession) -> str:
+        seen.append(browser.user_agent)
+        if len(seen) == 1:
+            fake_ref[0].request_ua = TAB_UA  # вкладка догрузилась
+            raise RuntimeError("страница входа")
+        return "ok"
+
+    def configure(fake: FakeBrowser) -> None:
+        fake.request_ua = None
+        fake_ref.append(fake)
+
+    asyncio.run(
+        capture(tmp_path, stages, validate, configure=configure, revalidate_interval=0)
+    )
+    assert seen == [BROWSER_UA, TAB_UA]
